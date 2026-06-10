@@ -28,6 +28,24 @@ from EvoScientist.config import (
 # =============================================================================
 
 
+@pytest.fixture(autouse=True)
+def _restore_dangerous_env():
+    """Snapshot/restore EVOSCIENTIST_DANGEROUS_MODE around every test.
+
+    apply_config_to_env writes this var via direct ``os.environ`` assignment, and
+    monkeypatch's ``delenv`` of an originally-absent key records no undo — so
+    without this, a test that turns dangerous mode on would leak the env var into
+    later tests (an order-dependent landmine, e.g. under pytest-randomly).
+    """
+    _sentinel = object()
+    _prev = os.environ.get("EVOSCIENTIST_DANGEROUS_MODE", _sentinel)
+    yield
+    if _prev is _sentinel:
+        os.environ.pop("EVOSCIENTIST_DANGEROUS_MODE", None)
+    else:
+        os.environ["EVOSCIENTIST_DANGEROUS_MODE"] = _prev
+
+
 @pytest.fixture
 def temp_config_dir(tmp_path, monkeypatch):
     """Use a temporary directory for config during tests."""
@@ -53,6 +71,7 @@ def temp_config_dir(tmp_path, monkeypatch):
         "EVOSCIENTIST_AUXILIARY_MODEL",
         "EVOSCIENTIST_AUXILIARY_PROVIDER",
         "EVOSCIENTIST_OPENROUTER_ANTHROPIC_PROMPT_CACHE",
+        "EVOSCIENTIST_DANGEROUS_MODE",
     ]:
         monkeypatch.delenv(key, raising=False)
     return config_dir
@@ -75,6 +94,7 @@ def clean_env(monkeypatch):
         "EVOSCIENTIST_AUXILIARY_MODEL",
         "EVOSCIENTIST_AUXILIARY_PROVIDER",
         "EVOSCIENTIST_OPENROUTER_ANTHROPIC_PROMPT_CACHE",
+        "EVOSCIENTIST_DANGEROUS_MODE",
     ]:
         monkeypatch.delenv(key, raising=False)
 
@@ -143,6 +163,18 @@ class TestEvoScientistConfig:
         assert config.provider == "openai"
         assert config.model == "gpt-4o"
         assert config.default_mode == "run"
+
+    def test_dangerous_mode_default(self):
+        """dangerous_mode defaults off and does not force auto_approve."""
+        config = EvoScientistConfig()
+        assert config.dangerous_mode is False
+        assert config.auto_approve is False
+
+    def test_dangerous_mode_implies_auto_approve(self):
+        """Enabling dangerous_mode forces auto_approve via __post_init__."""
+        config = EvoScientistConfig(dangerous_mode=True)
+        assert config.dangerous_mode is True
+        assert config.auto_approve is True
 
 
 # =============================================================================
@@ -611,6 +643,44 @@ class TestApplyConfigToEnv:
         assert os.environ.get("EVOSCIENTIST_OPENROUTER_ANTHROPIC_PROMPT_CACHE") == (
             "true"
         )
+
+    def test_dangerous_mode_round_trips_to_env(self, clean_env, monkeypatch):
+        """dangerous_mode set via CLI override must survive a fresh re-read.
+
+        Regression: a --dangerous CLI flag is never persisted to file/env, so a
+        fresh get_effective_config() (warning banner, run_in_background, the
+        langgraph dev subprocess) would read it back as False while the backend
+        is already unconfined. apply_config_to_env round-trips it to env.
+        """
+        from EvoScientist.config import get_effective_config
+
+        monkeypatch.delenv("EVOSCIENTIST_DANGEROUS_MODE", raising=False)
+        cfg = get_effective_config({"dangerous_mode": True})
+        assert cfg.dangerous_mode is True
+
+        apply_config_to_env(cfg)
+        assert os.environ.get("EVOSCIENTIST_DANGEROUS_MODE") == "true"
+        # The fresh, no-override read now agrees with the backend.
+        assert get_effective_config().dangerous_mode is True
+
+    def test_dangerous_mode_not_applied_when_off(self, clean_env, monkeypatch):
+        """dangerous_mode=False must not write the env var."""
+        monkeypatch.delenv("EVOSCIENTIST_DANGEROUS_MODE", raising=False)
+        apply_config_to_env(EvoScientistConfig())
+        assert os.environ.get("EVOSCIENTIST_DANGEROUS_MODE") is None
+
+    def test_dangerous_mode_off_clears_stale_env(self, clean_env, monkeypatch):
+        """Re-applying a non-dangerous config clears a previously-set env var.
+
+        Regression: the round-trip used to be set-only, so once dangerous mode
+        was applied in a process it could never be lowered — leaking unconfined
+        access into later non-dangerous reads.
+        """
+        monkeypatch.delenv("EVOSCIENTIST_DANGEROUS_MODE", raising=False)
+        apply_config_to_env(EvoScientistConfig(dangerous_mode=True))
+        assert os.environ.get("EVOSCIENTIST_DANGEROUS_MODE") == "true"
+        apply_config_to_env(EvoScientistConfig())  # dangerous off
+        assert os.environ.get("EVOSCIENTIST_DANGEROUS_MODE") is None
 
     def test_ollama_base_url_applied(self, clean_env, monkeypatch):
         """Test that ollama_base_url is applied to OLLAMA_BASE_URL env var."""
